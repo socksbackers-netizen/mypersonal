@@ -3,39 +3,51 @@ from flask import Flask, request, jsonify
 import base64
 import json
 import re
+import uuid
 
 app = Flask(__name__)
 
-# Updated working headers
+# Create session with proper cookies
+session = requests.Session()
+
+# First get cookies and CSRF token from main page
+def init_session():
+    try:
+        resp = session.get("https://tathya.uidai.gov.in/retrieveEidUid/en/", timeout=20)
+        # Extract CSRF token
+        csrf_match = re.search(r'name="csrfToken"\s+value="([^"]+)"', resp.text)
+        if not csrf_match:
+            csrf_match = re.search(r'csrfToken["\']?\s*:\s*["\']([^"\']+)', resp.text)
+        csrf_token = csrf_match.group(1) if csrf_match else None
+        
+        # Extract transaction ID
+        txn_match = re.search(r'transactionId["\']?\s*:\s*["\']([^"\']+)', resp.text)
+        txn_id = txn_match.group(1) if txn_match else str(uuid.uuid4())
+        
+        return csrf_token, txn_id
+    except Exception as e:
+        print(f"Init error: {e}")
+        return None, str(uuid.uuid4())
+
+CSRF_TOKEN, TXN_ID = init_session()
+print(f"CSRF: {CSRF_TOKEN}, TXN: {TXN_ID}")
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-IN,en;q=0.9",
     "Content-Type": "application/json",
-    "Origin": "https://resident.uidai.gov.in",
-    "Referer": "https://resident.uidai.gov.in/online-aadhaar-retrieve-eid-uid",
-    "X-Requested-With": "XMLHttpRequest"
+    "Origin": "https://tathya.uidai.gov.in",
+    "Referer": "https://tathya.uidai.gov.in/retrieveEidUid/en/",
+    "X-Requested-With": "XMLHttpRequest",
+    "appID": "MYAADHAAR"
 }
-
-# Session to maintain cookies
-session = requests.Session()
-
-# Get CSRF token first
-def get_csrf():
-    try:
-        resp = session.get("https://resident.uidai.gov.in/online-aadhaar-retrieve-eid-uid", timeout=15)
-        match = re.search(r'name="csrf_token"\s+value="([^"]+)"', resp.text)
-        return match.group(1) if match else None
-    except:
-        return None
-
-CSRF_TOKEN = get_csrf()
 if CSRF_TOKEN:
-    HEADERS["X-CSRF-Token"] = CSRF_TOKEN
+    HEADERS["X-CSRF-TOKEN"] = CSRF_TOKEN
 
 @app.route('/')
 def home():
-    return "Proxy alive - UIDAI Bot"
+    return "Proxy alive - Tathya UIDAI Bot"
 
 @app.route('/send-otp', methods=['POST'])
 def send_otp():
@@ -43,29 +55,33 @@ def send_otp():
     name = data.get('name', '')
     mobile = data.get('mobile', '')
     
-    # Updated working endpoint
-    url = "https://resident.uidai.gov.in/api/request-otp"
+    url = "https://tathya.uidai.gov.in/retrieveEidUid/ext/v1/generic/retrieveuideid"
     payload = {
         "mobileNumber": mobile,
-        "type": "uid"
+        "skipName": not bool(name),
+        "skipDOB": True,
+        "transactionId": TXN_ID
     }
     if name:
         payload["name"] = name
+        payload["skipName"] = False
     
     try:
-        r = session.post(url, json=payload, headers=HEADERS, timeout=20)
-        print(f"Send OTP Response: {r.status_code} - {r.text}")
+        print(f"Sending payload: {payload}")
+        r = session.post(url, json=payload, headers=HEADERS, timeout=25)
+        print(f"Send OTP Response: {r.status_code} - {r.text[:200]}")
         
         if r.status_code == 200:
             resp_data = r.json()
-            if resp_data.get("status") == "success":
+            # Check for success (OTP sent)
+            if "errorCode" not in resp_data:
                 return jsonify({
-                    "success": True, 
+                    "success": True,
                     "response": r.text,
-                    "txnId": resp_data.get("txnId", "")
+                    "txnId": resp_data.get("transactionId", TXN_ID)
                 })
             else:
-                return jsonify({"success": False, "error": resp_data.get("message", "Failed")})
+                return jsonify({"success": False, "error": resp_data.get("errorDetails", {}).get("messageEnglish", "Failed")})
     except Exception as e:
         print(f"Send OTP Error: {e}")
         return jsonify({"success": False, "error": str(e)})
@@ -76,29 +92,34 @@ def send_otp():
 def verify_otp():
     data = request.json
     otp = data.get('otp')
-    txn_id = data.get('tx_id', '')
+    tx_id = data.get('tx_id', TXN_ID)
     
-    url = "https://resident.uidai.gov.in/api/verify-otp"
+    url = "https://tathya.uidai.gov.in/retrieveEidUid/ext/v1/generic/validateOtp"
     payload = {
-        "txnId": txn_id,
-        "otp": otp
+        "otp": otp,
+        "transactionId": tx_id
     }
     
     try:
         r = session.post(url, json=payload, headers=HEADERS, timeout=20)
-        print(f"Verify OTP Response: {r.status_code} - {r.text}")
+        print(f"Verify OTP Response: {r.status_code} - {r.text[:200]}")
         
         if r.status_code == 200:
             resp_data = r.json()
-            if resp_data.get("status") == "success":
+            if "errorCode" not in resp_data:
+                # Extract UID/EID
                 uid = resp_data.get("eid") or resp_data.get("uid")
+                if not uid:
+                    match = re.search(r'(\d{12}|\d{16}|\d{28})', r.text)
+                    if match:
+                        uid = match.group(1)
                 return jsonify({
-                    "success": True, 
+                    "success": True,
                     "response": r.text,
                     "uid": uid
                 })
             else:
-                return jsonify({"success": False, "error": resp_data.get("message", "Invalid OTP")})
+                return jsonify({"success": False, "error": resp_data.get("errorDetails", {}).get("messageEnglish", "Invalid OTP")})
     except Exception as e:
         print(f"Verify OTP Error: {e}")
         return jsonify({"success": False, "error": str(e)})
@@ -110,23 +131,23 @@ def send_pdf_otp():
     data = request.json
     uid = data.get('uid')
     
-    url = "https://resident.uidai.gov.in/api/request-pdf"
+    url = "https://tathya.uidai.gov.in/aadhaarPdf/ext/v1/generic/downloadRequest"
     payload = {"eid": uid}
     
     try:
         r = session.post(url, json=payload, headers=HEADERS, timeout=20)
-        print(f"Send PDF OTP Response: {r.status_code} - {r.text}")
+        print(f"Send PDF OTP Response: {r.status_code} - {r.text[:200]}")
         
         if r.status_code == 200:
             resp_data = r.json()
-            if resp_data.get("status") == "success":
+            if "errorCode" not in resp_data:
                 return jsonify({
-                    "success": True, 
+                    "success": True,
                     "response": r.text,
-                    "txnId": resp_data.get("txnId", "")
+                    "txnId": resp_data.get("requestId", str(uuid.uuid4()))
                 })
             else:
-                return jsonify({"success": False, "error": resp_data.get("message", "Failed")})
+                return jsonify({"success": False, "error": resp_data.get("errorDetails", {}).get("messageEnglish", "Failed")})
     except Exception as e:
         print(f"Send PDF OTP Error: {e}")
         return jsonify({"success": False, "error": str(e)})
@@ -140,18 +161,27 @@ def download_pdf():
     otp = data.get('otp')
     txn_id = data.get('txn_id', '')
     
-    url = "https://resident.uidai.gov.in/api/download-pdf"
-    payload = {"txnId": txn_id, "otp": otp}
+    url = "https://tathya.uidai.gov.in/aadhaarPdf/ext/v1/generic/confirmDownload"
+    payload = {
+        "eid": uid,
+        "otp": otp,
+        "requestId": txn_id
+    }
     
     try:
         r = session.post(url, json=payload, headers=HEADERS, timeout=30)
         print(f"Download PDF Response: {r.status_code}")
         
-        if r.status_code == 200 and "application/pdf" in r.headers.get("Content-Type", ""):
-            return jsonify({
-                "success": True, 
-                "pdf": base64.b64encode(r.content).decode()
-            })
+        if r.status_code == 200:
+            resp_data = r.json()
+            pdf_url = resp_data.get("pdfUrl")
+            if pdf_url:
+                pdf_resp = requests.get(pdf_url, timeout=30)
+                if pdf_resp.status_code == 200:
+                    return jsonify({
+                        "success": True,
+                        "pdf": base64.b64encode(pdf_resp.content).decode()
+                    })
     except Exception as e:
         print(f"Download PDF Error: {e}")
         return jsonify({"success": False, "error": str(e)})
